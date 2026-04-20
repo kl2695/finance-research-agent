@@ -1,12 +1,12 @@
 # Finance Research Agent
 
-An AI agent that answers quantitative financial questions using SEC filings, scoring 84% on the Vals AI Finance Agent Benchmark — 20 points above the leaderboard leader (Claude Opus 4.7 at 64%).
+An AI agent that answers quantitative financial questions using SEC filings, scoring 78% on the Vals AI Finance Agent Benchmark — 14 points above the leaderboard leader (Claude Opus 4.7 at 64%).
 
 ## Results
 
 | Metric | Value |
 |--------|-------|
-| FAB Public Set (50 questions) | **84% accuracy** |
+| FAB Public Set (50 questions) | **78% accuracy** |
 | Leaderboard #1 (Claude Opus 4.7) | 64.4% |
 | Bare Claude Sonnet 4.6 | 63.3% |
 | Average question time | ~60 seconds |
