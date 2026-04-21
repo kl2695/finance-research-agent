@@ -165,7 +165,7 @@ class TestReplayRegression:
             # Count how many keys had values from XBRL
             xbrl_filled = sum(1 for dp in data_needed.values()
                              if isinstance(dp, dict)
-                             and dp.get("source", "").startswith("SEC EDGAR XBRL"))
+                             and (dp.get("source") or "").startswith("SEC EDGAR XBRL"))
 
             if xbrl_filled == 0:
                 continue

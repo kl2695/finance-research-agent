@@ -62,14 +62,25 @@ def extract_from_tool_log(tool_log: list[dict], state: dict) -> dict:
             best = matches[0]  # Take highest confidence match
             value = best["value"]
 
-            # Unit sanity check: don't fill percentage keys with dollar amounts
+            # Unit sanity check: don't fill keys with clearly wrong magnitudes
             unit = dp.get("unit", "")
             unit_lower = unit.lower() if unit else ""
             key_lower_check = key.lower()
-            is_pct_key = any(w in key_lower_check for w in ("margin", "rate", "percent", "pct", "ratio"))
+
+            # Percentage/ratio keys: value should be < 1000
+            is_pct_key = any(w in key_lower_check for w in ("margin", "rate", "percent", "pct", "ratio", "growth"))
             is_pct_unit = "%" in unit_lower or "percent" in unit_lower or "bps" in unit_lower
             if (is_pct_key or is_pct_unit) and abs(value) > 1000:
                 log.info(f"  Skipping {key}: value {value} too large for a percentage/ratio key")
+                continue
+
+            # Small-number keys (per-unit metrics, counts, days): value should be < 10,000
+            is_small_key = any(w in key_lower_check for w in (
+                "nights", "per_night", "per_booking", "per_room", "per_user", "per_member",
+                "days_", "turnover", "times", "multiple", "utilization",
+            ))
+            if is_small_key and abs(value) > 10000:
+                log.info(f"  Skipping {key}: value {value} too large for a per-unit/small metric key")
                 continue
 
             dp["value"] = value

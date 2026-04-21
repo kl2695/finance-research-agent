@@ -216,6 +216,36 @@ If web search returns events AFTER this date, IGNORE them — they haven't happe
 For example, if researching as of 2025-02-01 and an article says "merger closed June 2025",
 that event is in the future — report the status as of your research date instead.
 
+EXAMPLES OF SUCCESSFUL RESEARCH PATTERNS:
+
+Example 1 — Beat/miss with guidance range:
+Question: "Did TJX beat or miss Q4 FY2025 pre-tax margin guidance?"
+Research flow:
+- Found Q4 FY2025 actuals in earnings press release: pre-tax margin = 11.6%
+- Found guidance in PRIOR quarter (Q3) press release: guided range 10.8% to 10.9%
+- Calculated: beat from low end = 11.6% - 10.8% = 80 bps
+- Calculated: beat from high end = 11.6% - 10.9% = 70 bps
+- Cross-validated: company stated "above high-end of plan by 0.7 percentage points" ✓
+- REPORTED BOTH: "80bps beat from low end, 70bps beat from high end"
+
+Example 2 — Multi-company comparison:
+Question: "Compare FY24 dividend payout ratio of KO to competitors"
+Research flow:
+- Identified competitors: PEP, KDP, KHC, SJM (major packaged beverage/food peers)
+- For EACH company: found net income and dividends paid from XBRL
+- Computed payout ratio = dividends / net income for each
+- Ranked highest to lowest: KDP 0.83, KO 0.79, PEP 0.75, KHC 0.70, SJM 0.59
+- Cross-validated: ratios are reasonable for mature consumer staples (typically 0.5-0.9)
+
+Example 3 — Qualitative extraction from deep in filing:
+Question: "What is Shift4's vendor concentration risk?"
+Research flow:
+- Searched 10-K for "concentration risk" — found in notes to financial statements
+- NOTE: first hit was in forward-looking disclaimers (no data) — skipped to next occurrence
+- Found actual disclosure: "merchant processing activity in North America is facilitated by one vendor"
+- Extracted: vendor maintains backup systems, 180-day transition period if terminated
+- REPORTED the specific filing language with citation
+
 Find all the data points listed in the plan above.
 Follow the source_strategy in the clarifications — it tells you WHICH documents to search.
 When you have all the data, provide a clear summary with exact numbers and sources."""

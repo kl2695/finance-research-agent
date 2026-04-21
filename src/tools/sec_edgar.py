@@ -732,8 +732,9 @@ def get_earnings_press_release(ticker: str, quarter: str) -> str:
     except ValueError as e:
         return str(e)
 
-    # Parse quarter
-    q_match = _re.match(r'Q(\d)\s*(\d{4})', quarter.strip())
+    # Parse quarter — accepts "Q4 2024", "Q4 FY2024", "Q4FY2024"
+    cleaned_quarter = _re.sub(r'FY\s*', '', quarter.strip(), flags=_re.IGNORECASE)
+    q_match = _re.match(r'Q(\d)\s*(\d{4})', cleaned_quarter)
     if not q_match:
         return f"Invalid quarter format: '{quarter}'. Use 'Q4 2024' format."
 
@@ -793,7 +794,8 @@ def get_earnings_press_release(ticker: str, quarter: str) -> str:
             for match in _re.finditer(r'href="([^"]*)"', resp.text):
                 href = match.group(1)
                 href_lower = href.lower()
-                if any(kw in href_lower for kw in ["pressreleas", "ex99", "earnings", "exhibit99", "shareholder", "letter"]):
+                if (any(kw in href_lower for kw in ["pressreleas", "ex99", "991", "exhibit99", "shareholder"])
+                        and "slides" not in href_lower and "presentation" not in href_lower):
                     if href.startswith("/"):
                         exhibit_url = f"https://www.sec.gov{href}"
                     else:
@@ -819,7 +821,8 @@ def get_earnings_press_release(ticker: str, quarter: str) -> str:
         for match in _re.finditer(r'href="([^"]*)"', resp_idx.text):
             href = match.group(1)
             href_lower = href.lower()
-            if any(kw in href_lower for kw in ["pressreleas", "ex99", "earnings", "exhibit99", "shareholder", "letter"]):
+            if (any(kw in href_lower for kw in ["pressreleas", "ex99", "991", "exhibit99", "shareholder"])
+                        and "slides" not in href_lower and "presentation" not in href_lower):
                 # Check if filename contains the fiscal quarter tag
                 # Try both 4-digit ("2025") and 2-digit ("25") year matching
                 # because companies use "fy25" or "fy2025" interchangeably

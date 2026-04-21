@@ -903,4 +903,72 @@ General principle: every value that moves FROM LLM reasoning TO deterministic co
 5. For KPIs — extract company-reported values directly, don't compute from components
 **General principle:** Move logic from LLM (non-deterministic) to code (deterministic). The more the pipeline depends on regex, XBRL, and Python calculation, the more stable the results.
 **Estimated impact:** Stabilizing 3-4 flaky questions would add +2-3 to the score reliably.
+**KEY INSIGHT from Vals AI v1.1:** Their evaluator uses "the mode of three evaluations to reduce variance." We should implement the same in our judge — run each criterion judgment 3x and take the majority vote. This directly addresses judge non-determinism (idx 16, 23, 33 in our eval). Also: our deterministic numeric pre-check already handles the most common judge variance (close numeric values). The remaining variance is from the AGENT side (different tool paths each run), which mode-of-3 judging won't fix.
 **Status:** Open — Phase 4.
+
+---
+
+## P104: Private Test Set Uses Absolute Dates — Our Date Context Issues May Not Apply
+**Observed:** The FAB v1.1 refresh replaced relative dates ("current year", "most recent") with absolute dates ("Q1-Q4 2024"). This means the private test set likely doesn't have the date ambiguity issues we encountered on the public set (US Steel merger outcome, JM Smucker facility status, RDFN acquisition).
+**Root cause:** Public set questions used relative temporal references that caused the agent to anchor incorrectly. Private set questions specify exact date ranges, removing this ambiguity class entirely.
+**Impact:** Our `as_of_date` mechanism and ReAct date awareness instruction are needed for the 50-question public set but might be unnecessary (or harmful) for the 337-question private set. If private set questions use absolute dates, the agent should answer with the latest available data — not restrict to a benchmark epoch.
+**Solution:** When submitting to the private set, either remove `as_of_date` or set it to today's date.
+**Status:** Noted — relevant for Phase 5 (private set submission).
+
+---
+
+## P105: Top Benchmark Performers Use High Tool Call Counts
+**Observed:** From Vals AI's leaderboard analysis: "top performers register relatively high numbers of tool calls" — particularly edgar_search, parse_html_page, and web search. Successful agents follow a pattern: initial search → parse documents → retrieve specific information.
+**Root cause:** Complex multi-filing questions require iterative retrieval that a low turn budget cuts short.
+**Impact:** Our agent averages ~15-20 tool calls per question. If top performers use 30+, we might be under-researching. The ReAct loop `max_turns=10` may be too restrictive for complex questions that need multiple filing accesses.
+**Possible solutions:** a) Increase max_turns for complex questions. b) The prefetch already handles multiple filings — combined with ReAct calls, total should be sufficient. c) Quality of tool calls matters more than quantity — our structured approach is more targeted than brute-force searching.
+**Status:** Open — monitor on private set.
+
+---
+
+## P106: Tool Framework Mismatch — Private Set Uses Different Tools
+**Observed:** The Vals AI harness provides: Tavily (web search), SEC-API.io (EDGAR search), ParseHTML (document chunker), RetrieveInformation (targeted Q&A over chunks). Our agent uses: Claude built-in web search, direct SEC EDGAR httpx calls, custom table parser, section extraction.
+**Root cause:** Our agent was built against Claude's native tool interface, not the Vals AI harness tool interface.
+**Impact:** To submit to the private test set, we'd need to either: (a) rewrite our tool layer to use their APIs, (b) wrap our entire pipeline as a "custom model" via their `get_custom_model` interface, or (c) build an adapter layer that translates between their tool calls and our internal functions.
+**Solution:** Build adapter layer (option c) — least disruptive to core logic.
+**Estimated effort:** 1-2 days of integration work.
+**Status:** Open — Phase 5 blocker.
+
+---
+
+## P107: No Few-Shot Examples in ReAct Prompt — Paper Says 12-18% Accuracy Gain
+**Observed:** The FAB benchmark paper (arxiv.org/abs/2508.00828) reports that "few-shot examples demonstrating proper financial reasoning increase accuracy by 12-18%." Our ReAct system prompt has detailed instructions but ZERO worked examples showing the agent what a successful research flow looks like.
+**Root cause:** We focused on instruction-based prompting (rules, guidelines, methodology) but never added concrete examples of successful research patterns.
+**Solution approach:** Add 3 few-shot examples to the ReAct prompt, targeting our weakest question patterns (not one per type — the paper says 2-3 examples give the full 12-18% boost):
+
+1. **Beat/miss with both endpoints** (covers Beat or Miss, our #1 failure mode at 57-71%):
+   Show the full flow: find actuals from earnings press release → find guidance range from prior quarter → compute beat vs BOTH low end AND high end → cross-validate against stated margin.
+
+2. **Multi-company comparison** (covers Market Analysis at 33-67%):
+   Show: identify all companies → fetch each company's data separately → compute the metric for each → rank and compare.
+
+3. **Qualitative deep-section extraction** (covers Qualitative Retrieval where data is deep in filing):
+   Show: identify the right section name → the filing may have the term in forward-looking disclaimers first (skip those) → find the section with actual data → extract key points with citations.
+
+**Why 3 not 9:** Each type maps to one of 3 research PATTERNS (lookup, calculate, compare). The paper found 2-3 examples provide the full accuracy boost. 9 examples would add ~3000 tokens to every prompt, causing instruction dilution and higher cost. Focus examples on our WEAKEST patterns for maximum ROI.
+
+**Why these 3:** Based on our failure analysis: Beat or Miss (57-71%), Market Analysis (33-67%), and Qualitative Retrieval (78% but loses to deep-section issues) are our weakest. Numerical Reasoning (100%) and Complex Retrieval (100%) don't need examples.
+
+**Impact:** Potentially the single highest-impact change remaining. Paper estimates 12-18% accuracy improvement.
+**Status:** Open — highest priority.
+
+---
+
+## P108: Reasoning Failures > Retrieval Failures (45% vs 35% of Errors)
+**Observed:** The FAB paper's error analysis: retrieval failures = ~35% of errors, reasoning failures = ~45%, hybrid = ~20%. Our system confirms this — we rarely fail to FIND the right filing, but often fail to EXTRACT the right value or INTERPRET context correctly.
+**Root cause:** Engineering effort weighted toward retrieval (filings_needed, section extraction, table parsing). The reasoning/interpretation layer has received less attention.
+**Implications:** More tool calls won't help. Better extraction matching and cross-validation would. Performance ceiling is 80-85% per the paper — we're at 78%.
+**Status:** Noted — architectural insight.
+
+---
+
+## P109: Performance Ceiling Is 80-85% — Last 7% Requires Reasoning Breakthrough
+**Observed:** The paper identifies "performance ceiling for current approaches around 80-85%, with remaining gap attributable to reasoning complexity rather than retrieval adequacy." We're at 78%.
+**Root cause:** Hardest questions require: interpreting narrative context, recognizing missing/unreliable data, handling novel instruments, multi-source synthesis.
+**Impact:** Going from 78% → 85% requires fundamentally different capabilities than 68% → 78%. Easy wins exhausted.
+**Status:** Noted — sets expectations.

@@ -4,6 +4,44 @@ Prioritized list of next steps. Updated after each eval run.
 
 ---
 
+## Next Up — Non-Determinism Fix
+
+**Problem:** We gain 6 questions from our fixes but randomly lose 6 others each run (non-determinism). Net = 0. True capability is ~86-88% but measured at 78%.
+
+**Fix: Mode-of-3 judging (from Vals AI v1.1 methodology)**
+- Run each judge criterion 3x, take majority vote
+- Eliminates JUDGE non-determinism (which causes ~3 of the 6 random losses)
+- Cost: 3x more Haiku calls for judging (~$3 total per eval instead of ~$1)
+- Doesn't fix AGENT non-determinism (different tool paths) — that needs Phase 4 caching
+
+**Additional fixes from benchmark analysis:**
+| Fix | Impact | Effort |
+|-----|--------|--------|
+| Mode-of-3 judging | Stabilizes 3 judge-flaky questions | Low — add loop in eval.py |
+| Increase max_turns for hard questions | May improve complex retrieval | Low |
+| Remove as_of_date for private set | Private set uses absolute dates | Trivial |
+| Tool framework adapter for submission | Required for leaderboard | 1-2 days |
+
+---
+
+### Paper-Informed Improvements (from FAB Benchmark Paper)
+
+| Priority | Fix | Expected Impact | Effort | Problem |
+|----------|-----|-----------------|--------|---------|
+| 1 | **Few-shot examples in ReAct prompt** | +12-18% per paper | Medium | P107 |
+| 2 | Cross-validation enforcement | Catches reasoning errors | Medium | P108 |
+| 3 | Deterministic extraction paths | Stabilizes 3-4 flaky questions | High | P103 |
+| 4 | Domain fine-tuning | +20-30% per paper (out of scope) | Very high | N/A |
+
+**Key paper findings:**
+- Error split: 35% retrieval, 45% reasoning, 20% hybrid → focus on reasoning quality
+- Performance ceiling: 80-85% for current approaches → we're at 78%, near ceiling
+- Few-shot examples: 12-18% accuracy boost → biggest untapped opportunity
+- Top agents: plan before acting (we do ✓), cross-validate (we should do more), recover from errors (our fallback pipeline ✓)
+- Agent failures cluster: narrative interpretation, missing data recognition, novel instruments → matches our failure patterns
+
+---
+
 ## Current Status
 
 - **Accuracy:** 34/50 (68%) baseline → estimated 43/50 (86%) with all fixes

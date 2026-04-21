@@ -113,7 +113,9 @@ def run(question: str, as_of_date: str | None = None) -> dict:
         ) + prefetch_context,
         tools=ALL_TOOLS,
         tool_executor=execute_tool,
-        max_turns=10,
+        # Complex questions (many data points or many filings) need more turns.
+        # Paper: "top performers register high numbers of tool calls" (P105)
+        max_turns=15 if len(state.get("filings_needed", [])) > 4 else 10,
     )
     tool_log = prefetch_log + tool_log
 
@@ -201,6 +203,9 @@ def run(question: str, as_of_date: str | None = None) -> dict:
             "values": {k: dp.get("value") for k, dp in state.get("data_needed", {}).items() if isinstance(dp, dict)}
         })
 
+    # --- Step 3.5: Cross-validation — check extracted values for obvious errors (P108) ---
+    state = _cross_validate_extraction(state)
+
     calc_steps = state.get("calculation_steps", [])
     if calc_steps:
         state = execute_calculations(state)
@@ -232,9 +237,117 @@ def run(question: str, as_of_date: str | None = None) -> dict:
     }
 
 
-def _plan(question: str, as_of_date: str | None = None) -> dict:
-    """Step 1: Create the research plan."""
+def _cross_validate_extraction(state: dict) -> dict:
+    """Step 3.5: Cross-validate extracted values for obvious errors.
+
+    Checks:
+    1. Duplicate values: if multiple unrelated keys have the SAME value, likely wrong extraction
+    2. Magnitude sanity: if a calculation would produce absurd results, clear bad inputs
+    3. Relationship consistency: if margin components don't produce a reasonable margin, flag it
+
+    Clears bad values (sets to None) so the formatter falls back to the narrative.
+    """
+    data_needed = state.get("data_needed", {})
+    filled = {k: dp for k, dp in data_needed.items()
+              if isinstance(dp, dict) and dp.get("value") is not None}
+
+    if len(filled) < 2:
+        return state  # Nothing to cross-validate
+
+    # Check 1: Duplicate values — if 3+ unrelated keys have the exact same value,
+    # the XBRL matching likely filled them all with one concept (P78 pattern)
+    value_counts = {}
+    for k, dp in filled.items():
+        val = dp["value"]
+        if isinstance(val, (int, float)):
+            value_counts.setdefault(val, []).append(k)
+
+    for val, keys in value_counts.items():
+        if len(keys) >= 3 and val > 1000:  # 3+ keys with same large value = suspicious
+            log.warning(f"  Cross-validation: {len(keys)} keys have same value {val:,.0f} — likely wrong extraction. Clearing.")
+            _log_action("cross_validation_duplicate", {"value": val, "keys": keys})
+            for k in keys:
+                data_needed[k]["value"] = None
+                data_needed[k]["source"] = None
+
+    # Check 2: Calculator sanity preview — if we can predict the result would be absurd,
+    # clear the inputs so the narrative handles it
+    calc_steps = state.get("calculation_steps", [])
+    for step in calc_steps:
+        formula = step.get("formula", "")
+        inputs = step.get("inputs", [])
+
+        # Quick check: if a division would produce > 1000x or < 0.001x, inputs are likely wrong
+        if "/" in formula and len(inputs) == 2:
+            num_key, den_key = inputs[0], inputs[1]
+            num_dp = data_needed.get(num_key, {})
+            den_dp = data_needed.get(den_key, {})
+            if isinstance(num_dp, dict) and isinstance(den_dp, dict):
+                num_val = num_dp.get("value")
+                den_val = den_dp.get("value")
+                if num_val and den_val and den_val != 0:
+                    ratio = abs(num_val / den_val)
+                    if ratio > 10000 or ratio < 0.0001:
+                        log.warning(f"  Cross-validation: {num_key}/{den_key} = {ratio:.2f} — absurd ratio, clearing both")
+                        _log_action("cross_validation_absurd_ratio", {
+                            "step": step["step"], "ratio": ratio,
+                            "numerator": f"{num_key}={num_val}", "denominator": f"{den_key}={den_val}"
+                        })
+                        data_needed[num_key]["value"] = None
+                        data_needed[den_key]["value"] = None
+
+    return state
+
+
+_PLAN_CACHE_PATH = Path("results/planner_cache.json")
+
+
+def _load_plan_cache() -> dict:
+    """Load the planner cache from disk."""
+    if _PLAN_CACHE_PATH.exists():
+        try:
+            with open(_PLAN_CACHE_PATH) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            return {}
+    return {}
+
+
+def _save_plan_cache(cache: dict):
+    """Save the planner cache to disk."""
+    _PLAN_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with open(_PLAN_CACHE_PATH, "w") as f:
+        json.dump(cache, f, indent=2, default=str)
+
+
+def _plan(question: str, as_of_date: str | None = None, use_cache: bool = True) -> dict:
+    """Step 1: Create the research plan.
+
+    With use_cache=True (default), reuses a previously successful plan for the same
+    question+date. This eliminates planner non-determinism (different key names,
+    different filings_needed) between runs. Clear the cache to force re-planning.
+    """
     today = as_of_date or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    # Check cache — key is question text + date
+    import hashlib
+    cache_key = hashlib.md5(f"{question}|{today}".encode()).hexdigest()
+
+    if use_cache:
+        cache = _load_plan_cache()
+        if cache_key in cache:
+            log.info("  Using cached plan")
+            state = cache[cache_key]
+            # Reset values for fresh extraction
+            for dp in state.get("data_needed", {}).values():
+                if isinstance(dp, dict):
+                    dp["value"] = None
+                    dp["source"] = None
+                    dp["confidence"] = None
+            for step in state.get("calculation_steps", []):
+                step["result"] = None
+            state["answer"] = {"value": None, "formatted": None, "sources": [], "work_shown": None}
+            return state
 
     response = call_claude(
         system=PLANNER_SYSTEM,
@@ -256,6 +369,13 @@ def _plan(question: str, as_of_date: str | None = None) -> dict:
     state.setdefault("data_needed", {})
     state.setdefault("calculation_steps", [])
     state.setdefault("filings_needed", [])
+
+    # Save to cache for future runs
+    if use_cache:
+        cache = _load_plan_cache()
+        cache[cache_key] = state
+        _save_plan_cache(cache)
+
     return state
 
 

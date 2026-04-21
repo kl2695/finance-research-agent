@@ -81,11 +81,61 @@ def run_question(question: str, idx: int) -> dict:
         }
 
 
+def _extract_numbers(text: str) -> list[float]:
+    """Extract all numbers from text for deterministic comparison."""
+    import re
+    numbers = []
+    # Match: $X.XX, X.XX%, X,XXX, plain decimals
+    for m in re.finditer(r'[\$]?\s*([\d,]+\.?\d*)\s*(%|billion|million|bps)?', text):
+        try:
+            val = float(m.group(1).replace(",", ""))
+            unit = m.group(2) or ""
+            if "billion" in unit.lower():
+                val *= 1e9
+            elif "million" in unit.lower():
+                val *= 1e6
+            numbers.append(val)
+        except ValueError:
+            pass
+    return numbers
+
+
+def _numeric_match(answer: str, criterion: str, tolerance: float = 0.02) -> bool | None:
+    """Deterministic numeric check — returns True/False if numbers match, None if can't determine."""
+    criterion_nums = _extract_numbers(criterion)
+    if not criterion_nums:
+        return None  # No numbers in criterion — can't do numeric check
+
+    answer_nums = _extract_numbers(answer)
+    if not answer_nums:
+        return None  # No numbers in answer — let LLM judge
+
+    # Check if ALL numbers in criterion have a close match in answer
+    for crit_num in criterion_nums:
+        if crit_num == 0:
+            continue
+        found_match = any(
+            abs(ans_num - crit_num) / abs(crit_num) < tolerance
+            for ans_num in answer_nums
+        )
+        if not found_match:
+            return None  # At least one number not matched — let LLM decide
+
+    return True  # All criterion numbers found in answer within tolerance
+
+
 def judge_criterion(answer: str, criterion: str, operator: str) -> dict:
     """Use LLM to judge whether an answer satisfies a rubric criterion.
 
     Returns {"pass": bool, "reasoning": str}.
     """
+    # Deterministic numeric pre-check for correctness criteria
+    # If all numbers in the criterion are found in the answer (within 2%), auto-pass
+    if operator == "correctness":
+        numeric_result = _numeric_match(answer, criterion)
+        if numeric_result is True:
+            return {"pass": True, "reasoning": "Deterministic numeric match (within 2% tolerance)"}
+
     if operator == "correctness":
         prompt = f"""Does the following answer contain or support this claim?
 Answer with ONLY "YES" or "NO" on the first line, then a brief reason.
@@ -109,24 +159,35 @@ ANSWER: {answer[:3000]}"""
     else:
         return {"pass": False, "reasoning": f"Unknown operator: {operator}"}
 
-    try:
-        response = call_claude(
-            system="You are a precise evaluator. Judge whether an answer meets a specific criterion.",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=150,
-            model=MODEL_HAIKU,
-        )
-        text = response.content[0].text.strip()
-        first_line = text.split("\n")[0].strip().upper()
+    # Mode-of-3 judging (from Vals AI v1.1 methodology): run 3x, take majority vote.
+    # Eliminates judge non-determinism where Haiku gives different answers each call.
+    votes = []
+    last_reasoning = ""
+    for _ in range(3):
+        try:
+            response = call_claude(
+                system="You are a precise evaluator. Judge whether an answer meets a specific criterion.",
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=150,
+                model=MODEL_HAIKU,
+            )
+            text = response.content[0].text.strip()
+            first_line = text.split("\n")[0].strip().upper()
 
-        if operator == "correctness":
-            passed = first_line.startswith("YES")
-        else:  # contradiction
-            passed = not first_line.startswith("YES")  # Pass = no contradiction
+            if operator == "correctness":
+                voted_pass = first_line.startswith("YES")
+            else:  # contradiction
+                voted_pass = not first_line.startswith("YES")
 
-        return {"pass": passed, "reasoning": text[:200]}
-    except Exception as e:
-        return {"pass": False, "reasoning": f"Judge error: {e}"}
+            votes.append(voted_pass)
+            last_reasoning = text[:200]
+        except Exception as e:
+            votes.append(False)
+            last_reasoning = f"Judge error: {e}"
+
+    # Majority vote (2/3 or 3/3 = pass)
+    passed = sum(votes) >= 2
+    return {"pass": passed, "reasoning": f"[{sum(votes)}/3 votes] {last_reasoning}"}
 
 
 def score_answer(answer: str, rubric_str: str) -> dict:
