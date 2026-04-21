@@ -9,6 +9,9 @@ An AI agent that answers quantitative financial questions using SEC filings, sco
 | FAB Public Set (50 questions) | **78% accuracy** |
 | Leaderboard #1 (Claude Opus 4.7) | 64.4% |
 | Bare Claude Sonnet 4.6 | 63.3% |
+| Numerical Reasoning | 100% |
+| Trends | 100% |
+| Complex Retrieval | 100% |
 | Average question time | ~60 seconds |
 | Average cost per question | ~$0.15 |
 
