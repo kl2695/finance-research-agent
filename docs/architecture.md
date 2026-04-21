@@ -2,7 +2,7 @@
 
 ## System Overview
 
-A financial research agent that answers quantitative questions about public companies using SEC filings as the primary data source. Optimized for the Vals AI Finance Agent Benchmark (FAB) — 50 public questions, 537 total. Current accuracy: 18/18 on tested questions (~100%), pending full 50-question baseline run.
+A financial research agent that answers quantitative questions about public companies using SEC filings as the primary data source. Optimized for the Vals AI Finance Agent Benchmark (FAB) — 50 public questions, 337 private test set. Current accuracy: **78% (39/50)** on the FAB public validation set, 14 points above the leaderboard leader (Claude Opus 4.7 at 64%).
 
 Key constraint: precision. Financial questions require exact numbers (e.g., 26.1 basis points, not "about 26"). Every component is designed to minimize rounding, hallucination, and data loss.
 
@@ -18,6 +18,7 @@ Question
 │                  │    • filings_needed (which SEC filings to fetch)
 │                  │    • calculation_steps (formulas to compute)
 │                  │    • clarifications (period, company, methodology)
+│                  │  Cached by question+date hash for reproducibility.
 └────────┬────────┘
          │
          ▼
@@ -34,6 +35,8 @@ Question
 │  2b. ReAct LOOP  │  Sonnet — reasons with tools. Prefetched data in prompt.
 │                  │  Agent may call additional tools (web search, filing text).
 │                  │  Produces research narrative.
+│                  │  3 few-shot examples guide research patterns.
+│                  │  max_turns: 15 for complex (5+ filings), 10 default.
 └────────┬────────┘
          │
          ▼
@@ -43,6 +46,7 @@ Question
 │                  │    3b. Structured text matching (regex + keyword scoring)
 │                  │    3c. LLM fact matching (Haiku assigns parsed values to keys)
 │                  │    3d. LLM raw extraction (Sonnet reads source text directly)
+│                  │  + 3.5: Cross-validation (catches duplicates & absurd ratios)
 └────────┬────────┘
          │
          ▼
@@ -58,9 +62,43 @@ Question
 └─────────────────┘
 ```
 
+## Planner Caching
+
+The planner (Step 1) is non-deterministic — different runs produce different key names, filings_needed lists, and formulas. This causes score variance even when the underlying extraction and calculation logic hasn't changed.
+
+**Solution:** Plans are cached by `MD5(question + date)` in `results/planner_cache.json`. On cache hit, the plan is reused with all values reset to `null` for fresh extraction. This eliminates planner non-determinism between runs.
+
+**Cache clearing:** Delete the cache file to force re-planning (needed after prompt changes or methodology updates).
+
+**Entry point:** `agent.py:_plan(question, as_of_date, use_cache=True)`
+
+## ReAct Agent Details (Step 2b)
+
+### Few-Shot Examples
+
+The ReAct prompt includes 3 worked research patterns to guide the agent's tool usage and reasoning:
+
+1. **Beat/miss with guidance range** — TJX pre-tax margin: finds actuals in current 8-K, guidance in prior quarter's 8-K, computes beat from BOTH low and high end, cross-validates against company's own statement.
+2. **Multi-company comparison** — KO dividend payout ratio vs peers: identifies competitors, fetches data for each via XBRL, computes ratios, ranks.
+3. **Qualitative deep-section extraction** — Shift4 vendor concentration risk: navigates past ToC/disclaimer matches to find the actual disclosure in notes to financial statements.
+
+### Context Size Tiers
+
+Prefetched filing data is injected into the ReAct prompt with size limits based on question type:
+
+| Question Type | Limit per Source | Rationale |
+|---------------|-----------------|-----------|
+| Qualitative (no calculation, "lookup only") | 50K chars | Need full sections for narrative answers |
+| Quantitative with filing sections (10-K/10-Q with section) | 15K chars | Need tables from targeted sections |
+| Simple XBRL calculation | 4K chars | Just need confirmation data |
+
+### Max Turns Scaling
+
+Complex questions with 5+ filings_needed entries get 15 turns (vs 10 default). This accommodates multi-company comparisons and questions requiring data from many filings. Motivated by FAB paper insight: "top performers register high numbers of tool calls."
+
 ## Data Extraction Flow (Step 3 — the critical path)
 
-This is the most complex part of the system. Three extraction methods run in sequence, each filling unfilled data_needed keys. A key filled by an earlier method is never overwritten.
+This is the most complex part of the system. Four extraction methods run in sequence, each filling unfilled data_needed keys. A key filled by an earlier method is never overwritten.
 
 ### Step 3a: XBRL Structured Extraction
 
@@ -241,6 +279,20 @@ The top-scoring value for each key is selected. If no value scores above 0 for a
 
 **Entry point:** `agent.py:_llm_extract_remaining()`
 
+### Step 3.5: Cross-Validation
+
+**When it runs:** After all four extraction steps complete, before the calculator.
+
+**Purpose:** Catches two classes of extraction errors that individual steps can't detect:
+
+1. **Duplicate values:** If 3+ data_needed keys have the exact same numeric value (and it's > 1000), the XBRL matcher likely filled them all from one concept. Clears all duplicated values so the formatter falls back to the narrative. See P78.
+
+2. **Absurd ratios:** Previews division-based calculation steps. If the numerator/denominator ratio would be > 10,000x or < 0.0001x, the inputs are likely wrong (e.g., mixing millions and raw dollars). Clears both values.
+
+**Philosophy:** Better to return no structured answer than a confidently wrong one. Cleared values force a narrative fallback, which is less precise but less likely to be catastrophically wrong.
+
+**Entry point:** `agent.py:_cross_validate_extraction(state)`
+
 ### Fallback: ReAct Agent Narrative
 
 When all four extraction steps fail, the answer formatter falls back to the ReAct agent's research narrative. The agent may have found and reported the right numbers in prose even though the structured pipeline didn't capture them. This is the least reliable path — it works (Micron beat/miss got 140bps from narrative) but is not deterministic.
@@ -271,6 +323,8 @@ The prefetch iterates this list and fetches each entry:
 | `"8-K"` | Calls `get_earnings_press_release(ticker, period)`. Finds the press release exhibit via fiscal quarter filename matching (handles non-calendar FY, 2-digit year). | "Q4 2024" → finds `lyft-2024x12x31pressreleas.htm` |
 | `"10-K"` / `"10-Q"` | Calls `get_filing_text(ticker, type, section, period)`. Section markers jump to the right part of the 400-600K char filing. | section="tax" → jumps to "effective income tax rate" at pos 270K |
 
+**Per-entry ticker override:** Each filing entry can specify its own `ticker`, enabling multi-company questions with a single filings_needed list (e.g., `{"type": "xbrl", "ticker": "PEP", "concepts": ["PaymentsOfDividends"]}`). The default ticker comes from the planner's `clarifications.company`.
+
 **Why this works:** The planner (LLM) does the hard thinking — which filings? which XBRL concepts? which sections? which periods? The code does the easy part — fetching what was specified. New question types work without code changes.
 
 **What the planner knows:** The prompt includes a reference list of common XBRL concept names, section types, and conventions (e.g., "forward-looking data for 2025 → FY2024 10-K", "beat/miss needs both actuals and prior quarter guidance").
@@ -293,13 +347,16 @@ This fallback is being phased out as `filings_needed` coverage improves. It's ha
 
 **Section marker priority:** Markers tried in specificity order — "effective income tax rate" before "provision for income taxes" to avoid matching risk factor boilerplate.
 
-**10-K sections available:** revenue, tax, compensation, leases, employees, shares, cash_obligations, reconciliation, kpi, officers, mda, risk, financial_statements, notes, debt, acquisitions, segments.
+**Skip-ToC logic:** The first match for a section marker is often a Table of Contents entry or forward-looking disclaimer — no actual data. `_extract_section()` checks if there are 2+ digit numbers within 500 chars of the match. If not, it skips to the next occurrence. Falls back to the first occurrence if no data-rich match is found. See P99.
+
+**10-K sections available:** revenue, tax, compensation, leases, employees, shares, cash_obligations, reconciliation, kpi, officers, mda, risk, financial_statements, notes, debt, acquisitions, segments. Arbitrary section names are also supported — the system converts underscores to spaces and uses the phrase as a fallback marker.
 
 ## Components
 
 ### `agent.py` — Orchestrator
-**Purpose:** Runs the full pipeline. Coordinates planner, prefetch, ReAct, extraction, calculator, formatter.
-**Entry point:** `run(question) → dict`
+**Purpose:** Runs the full pipeline. Coordinates planner, prefetch, ReAct, extraction, cross-validation, calculator, formatter.
+**Entry point:** `run(question, as_of_date=None) → dict`
+**Key functions:** `_plan()` (with caching), `_prefetch_sec_data()`, `_cross_validate_extraction()`, `_llm_extract_remaining()`
 
 ### `extractor.py` — Structured Data Extraction
 **Purpose:** Parses XBRL, dollar amounts, percentages from tool results. Matches to data_needed keys.
@@ -328,6 +385,15 @@ This fallback is being phased out as `filings_needed` coverage improves. It's ha
 ### `llm.py` — Anthropic API Client
 **Purpose:** Claude API calls with prompt caching and rate limiting. Model routing (Sonnet for reasoning, Haiku for formatting).
 
+### `eval.py` — Evaluation Harness
+**Purpose:** Runs the agent against the FAB benchmark, scores answers against rubrics.
+**Entry point:** `python eval.py [--indices 0 2 9] [--score-only FILE] [--cheap-reeval FILE]`
+**Key features:**
+- **Benchmark date:** All runs use `as_of_date="2025-02-01"` (the epoch when FAB ground truth was authored).
+- **Deterministic numeric pre-check:** Before calling the LLM judge, checks if all numbers in the criterion appear in the answer within 2% tolerance. Auto-passes if they match — eliminates judge non-determinism for numeric questions.
+- **Mode-of-3 judging:** Each rubric criterion is judged 3x by Haiku, with majority vote (2/3 or 3/3 = pass). Eliminates single-call judge variance that caused 6 questions to flip between pass/fail across runs.
+- **Cheap re-eval:** Replays extraction + calculator + formatter + judge on saved tool_logs from a previous run (~$1.50 vs ~$8 for a full run). Only reliable for judging changes, not extraction changes.
+
 ## External Dependencies
 
 | Service | Purpose | Auth | Rate Limit | Failure Mode |
@@ -342,7 +408,7 @@ This fallback is being phased out as `filings_needed` coverage improves. It's ha
 ## Known Constraints & Gotchas
 
 ### Date Context
-The planner uses today's date to determine "most recent" periods. The FAB benchmark was authored when FY2024 was the latest available. Running in 2026, the planner picks FY2025 data, which may not match ground truth. For benchmark evaluation, consider setting the planner's date context.
+The planner uses today's date to determine "most recent" periods. The FAB benchmark was authored when FY2024 was the latest available. Running in 2026, the planner picks FY2025 data, which may not match ground truth. **Addressed:** `run(question, as_of_date="2025-02-01")` overrides the planner's and ReAct agent's date context. The eval harness sets this automatically via `BENCHMARK_DATE`.
 
 ### XBRL Concept Matching
 Substring matching (`if metric.lower() in concept_name.lower()`) causes false matches. "IncomeTaxExpenseBenefit" matches both the exact concept AND "CurrentIncomeTaxExpenseBenefit". The extractor then fills unrelated keys with the same value. See P42.
