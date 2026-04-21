@@ -223,8 +223,18 @@ def score_answer(answer: str, rubric_str: str) -> dict:
     }
 
 
-def run_eval(indices: list[int] | None = None) -> dict:
-    """Run the full evaluation. Returns results dict."""
+def run_eval(indices: list[int] | None = None, cost_limit: float = 15.0) -> dict:
+    """Run the full evaluation. Returns results dict.
+
+    Args:
+        cost_limit: Hard stop on API cost in dollars. Default $15 (safety margin over ~$8 expected).
+                    Raises RuntimeError if exceeded, saving partial results.
+    """
+    from core.llm import set_cost_limit, get_cost_summary, reset_cost_tracking
+    reset_cost_tracking()
+    set_cost_limit(cost_limit)
+    log.info(f"Cost limit: ${cost_limit:.2f}")
+
     ds = load_fab_dataset()
     all_indices = indices if indices is not None else list(range(len(ds)))
 
@@ -261,10 +271,16 @@ def run_eval(indices: list[int] | None = None) -> dict:
             **score_result,
         })
 
+        cost = get_cost_summary()
         status = "PASS" if score_result["pass"] else "FAIL"
         log.info(f"[{idx:2d}] {status} ({score_result['criteria_passed']}/{score_result['criteria_total']}) "
-                 f"| {agent_result['elapsed']:.0f}s | {q_type}")
+                 f"| {agent_result['elapsed']:.0f}s | ${cost['total_cost']:.2f} cumulative | {q_type}")
 
+    cost = get_cost_summary()
+    log.info(f"\nTotal API cost: ${cost['total_cost']:.2f} "
+             f"({cost['total_calls']} calls, {cost['total_input_tokens']:,} input tokens, "
+             f"{cost['total_output_tokens']:,} output tokens, "
+             f"{cost['total_cache_read_tokens']:,} cache read tokens)")
     return _summarize(results)
 
 

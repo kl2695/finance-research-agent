@@ -24,6 +24,9 @@ Thumbs.db
 
 # Results (large JSON files with tool_logs)
 results/eval_*.json
+results/regression_gate.log
+results/planner_cache.json
+baseline_fab.json
 
 # pytest
 .pytest_cache/
