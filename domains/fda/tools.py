@@ -62,9 +62,16 @@ def _openfda_request(endpoint: str, params: dict[str, str]) -> dict:
     if _OPENFDA_API_KEY:
         params["api_key"] = _OPENFDA_API_KEY
 
+    # Build URL manually to avoid double-encoding of special chars in search queries
+    # openFDA expects +AND+ and brackets in the search param unencoded
+    search = params.pop("search", None)
     url = f"{BASE_URL}{endpoint}"
+    if search:
+        url += f"?search={search}"
+        if params:
+            url += "&" + "&".join(f"{k}={v}" for k, v in params.items())
     try:
-        r = httpx.get(url, params=params, timeout=30)
+        r = httpx.get(url, params=params if not search else None, timeout=30)
         r.raise_for_status()
         return r.json()
     except httpx.HTTPStatusError as e:
