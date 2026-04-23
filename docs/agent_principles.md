@@ -1,6 +1,6 @@
-# Finance Research Agent — Design Principles
+# Multi-Domain Research Agent — Design Principles
 
-Distilled from 59 problems encountered building a financial research agent against the Vals AI Finance Agent Benchmark. These are the non-obvious lessons — things that seem reasonable in theory but fail in practice with real SEC filings and financial data.
+Distilled from 103+ problems encountered building research agents against real benchmarks. Originally developed for the finance domain (Vals AI FAB), these principles generalize to any domain where precision and structured data extraction matter. The non-obvious lessons — things that seem reasonable in theory but fail in practice with real filings and structured databases.
 
 ---
 

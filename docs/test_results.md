@@ -1,4 +1,6 @@
-# Finance Research Agent — Test Results
+# Multi-Domain Research Agent — Test Results
+
+## Finance Domain (FAB Benchmark)
 
 Tracked results against the Vals AI Finance Agent Benchmark (FAB) public validation set (50 questions).
 

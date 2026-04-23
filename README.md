@@ -1,110 +1,93 @@
-# Finance Research Agent
+# Multi-Domain Research Agent
 
-An AI agent that answers quantitative financial questions using SEC filings, scoring 78% on the Vals AI Finance Agent Benchmark — 14 points above the leaderboard leader (Claude Opus 4.7 at 64%).
+A domain-agnostic AI agent that answers precise research questions using structured public databases. Pluggable domain modules handle domain-specific tools, prompts, extraction, and benchmarks. The core pipeline (planner → prefetch → ReAct → extraction → calculator → formatter) is shared across all domains.
+
+## Domains
+
+### Finance (SEC EDGAR)
+Answers quantitative financial questions using SEC filings. Scores **84% on the Vals AI Finance Agent Benchmark** — 20 points above the leaderboard leader (Claude Opus 4.7 at 64%).
+
+### FDA Regulatory (openFDA)
+Answers regulatory QA questions about medical devices using openFDA APIs and AccessData PDF scraping. Scores **90% on 510kQA** — a novel benchmark of 30 regulatory questions we built (no public benchmark existed).
 
 ## Results
 
-| Metric | Value |
-|--------|-------|
-| FAB Public Set (50 questions) | **78% accuracy** |
-| Leaderboard #1 (Claude Opus 4.7) | 64.4% |
-| Bare Claude Sonnet 4.6 | 63.3% |
-| Numerical Reasoning | 100% |
-| Trends | 100% |
-| Complex Retrieval | 100% |
-| Average question time | ~60 seconds |
-| Average cost per question | ~$0.15 |
+| Benchmark | Domain | Score | Leaderboard #1 | Bare Claude Sonnet |
+|-----------|--------|-------|-----------------|-------------------|
+| FAB (Vals AI) | Finance | **84%** (42/50) | 64% (Opus 4.7) | 63% (Sonnet 4.6) |
+| 510kQA (novel) | FDA | **90%** (27/30) | N/A (first benchmark) | N/A |
 
-Built by one person. Documented via 103 problems encountered and solved, 15 agent design principles, and a full architecture doc.
+Built by one person. Documented via 103 problems encountered and solved, 15 agent design principles, and full architecture docs for both domains.
 
 ## Architecture
 
 ```
-Question → Planner (LLM) → Prefetch (SEC EDGAR) → ReAct Agent → Extraction → Calculator → Answer
+research_agent/
+├── core/                    # Domain-agnostic pipeline
+│   ├── agent.py             # Orchestrator: plan → prefetch → ReAct → extract → calc → format
+│   ├── extractor.py         # Multi-layer extraction framework
+│   ├── calculator.py        # Deterministic Python formula evaluation
+│   ├── llm.py               # Anthropic API client with cost tracking
+│   └── types.py             # Shared types: Fact, FilingRequest, ToolResult, BenchmarkQuestion
+├── domains/
+│   ├── base.py              # Domain ABC — contract for all domains
+│   ├── finance/             # SEC EDGAR, XBRL, earnings press releases
+│   │   ├── domain.py        # FinanceDomain implementation
+│   │   ├── tools.py         # SEC EDGAR API client
+│   │   ├── concepts.py      # Financial concepts (CAGR, margins, ratios)
+│   │   └── methodology.py   # Financial methodology (beat/miss, turnover)
+│   └── fda/                 # openFDA, MAUDE, AccessData PDFs
+│       ├── domain.py        # FDADomain implementation
+│       ├── tools.py         # openFDA API client + PDF scraper
+│       ├── concepts.py      # Regulatory concepts (510(k), PMA, device classes)
+│       ├── methodology.py   # Regulatory methodology (clearance timelines, predicates)
+│       └── benchmark/       # 510kQA benchmark (30 questions)
+├── main.py                  # CLI: --domain {finance|fda} --question "..." --eval
+└── eval.py                  # Finance eval harness (FAB benchmark)
 ```
 
-**Key technical decisions:**
-
-- **Structured filing selection** — The LLM planner outputs a `filings_needed` list specifying exactly which SEC filings, XBRL concepts, and 10-K sections to fetch. The code just iterates and fetches. No hardcoded keyword maps needed for new question types.
-
-- **4-step hybrid extraction** — XBRL exact matching → structured text parsing (regex with table/column awareness) → LLM fact matching (Haiku assigns parsed values to keys) → LLM raw extraction fallback. Each step fills what the previous couldn't.
-
-- **HTML table parser with column annotations** — SEC filing tables are parsed structurally, annotating each value with its column header (e.g., `Total [Next 12 Months]: $14,426,266`). This preserves column context that flat-text extraction loses.
-
-- **Fiscal quarter filename matching** — Companies use non-standard fiscal years. The press release fetcher matches by fiscal quarter identifier in exhibit filenames (`a2024q3ex991` = Q3 FY2024), handling any fiscal year convention automatically.
-
-- **Programmatic over probabilistic** — For any data with deterministic structure (XBRL, dollar amounts, percentages), extract with regex — not an LLM. LLMs round. `$4,278.9 million` becomes `$4.3 billion` when an LLM summarizes. Code doesn't round.
-
-## How It Works
-
-1. **Planner** creates a structured research plan: what data is needed, which filings to fetch, what formulas to compute
-2. **Prefetch** fetches SEC EDGAR data (XBRL line items, earnings press releases, targeted 10-K sections) before the agent starts reasoning
-3. **ReAct Agent** reasons with the prefetched data + additional tool calls (web search, filing text)
-4. **Extraction** fills the plan's data_needed values using 4 methods in priority order
-5. **Calculator** executes formulas as deterministic Python (not LLM arithmetic)
-6. **Formatter** produces the final answer with citations
-
-## Debugging Methodology: Tracing a 1.3 bps Error
-
-One example of the systematic approach — the Lyft beat/miss question was off by 1.3 basis points (24.78 vs 26.1 ground truth):
+### Core Pipeline
 
 ```
-P27: "LLM rounds $4,278.9M to $4,300M" 
-  → investigated → not the LLM's fault
-
-P29: "Tool log truncates press release to 4,000 chars — financial tables start at char 5,500"
-  → removed truncation → but extractor still picks $4.3B
-
-P30: "Table values like '$ 4,278.9' have no unit suffix — '(in millions)' is in the header"
-  → added table-level unit detection → value now correct but wrong column picked
-
-P31: "Context keywords bleed across table rows"
-  → restricted to before-only context → right row, wrong column
-
-P32: "Position tiebreaker compares across documents"  
-  → added source_idx ordering → correct value selected
-
-P99: "Section marker finds ToC mention before actual data"
-  → skip occurrences without nearby numbers → finds data tables
+Question → Planner (LLM) → Prefetch (domain tools) → ReAct Agent → Extraction → Calculator → Answer
 ```
 
-Each step: observe → identify root cause → fix → discover next layer. The final answer: 26.08 bps (0.02 bps off ground truth). Full trace in [`docs/problems.md`](docs/problems.md).
+**Key design decisions:**
 
-## Documentation
+- **Domain ABC** — Every domain implements a single interface (~15 methods): prompts, tool dispatch, concept maps, extraction config, cross-validation, benchmark. Core pipeline depends only on this interface.
 
-This project is documented as a case study in systematic AI engineering:
+- **Structured source selection** — The LLM planner outputs a `filings_needed` list specifying exactly which data sources to fetch. The code dispatches to the domain's tool_dispatch map. No hardcoded source selection in core.
 
-- [`docs/problems.md`](docs/problems.md) — 103 problems encountered, each with observed behavior, root cause, solution, and status. Traces the evolution from "LLM rounds numbers" to "table column disambiguation."
-- [`docs/agent_principles.md`](docs/agent_principles.md) — 15 design principles distilled from the problems (e.g., "Programmatic over probabilistic", "Forward-looking data comes from the prior year's filing")
-- [`docs/architecture.md`](docs/architecture.md) — Full pipeline flow, data extraction flow (4 steps), prefetch system, component map
-- [`docs/test_results.md`](docs/test_results.md) — Detailed per-question results with failure analysis
-- [`docs/action_items.md`](docs/action_items.md) — Prioritized backlog with estimated impact per fix
+- **Multi-layer extraction** — Structured data exact matching → regex text parsing → LLM fact matching (Haiku) → LLM raw extraction (Sonnet). Each layer fills what the previous couldn't. Domains configure which layers run and what concept maps to use.
 
-## Setup
+- **Programmatic over probabilistic** — For data with deterministic structure (XBRL, JSON APIs, counts), extract with code — not an LLM. LLMs round. `$4,278.9 million` becomes `$4.3 billion` when an LLM summarizes. Code doesn't round.
+
+- **Every value carries provenance** — Answers cite specific database records (K-numbers, SEC filing accession numbers, MAUDE report IDs). The reviewer can verify any claim.
+
+## Usage
 
 ```bash
 # Clone and install
-cd "Product Prototyping/Finance Research Agent"
-python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-
-# Set API key
 echo "ANTHROPIC_API_KEY=your-key" > .env
 
-# Run tests (no API calls, <2 seconds)
-python -m pytest tests/ -q
+# Run a finance question
+python main.py --domain finance --question "Calculate the inventory turnover for US Steel in FY2024."
 
-# Run a single question
-python -c "from src.agent import run; print(run('Calculate the inventory turnover for US Steel in FY2024.')['answer'])"
+# Run an FDA question
+python main.py --domain fda --question "What is the clearance date for 510(k) K213456?"
 
-# Run the full benchmark evaluation
-python eval.py --verbose
+# Run benchmarks
+python main.py --domain finance --eval
+python main.py --domain fda --eval
 
-# Cheap re-eval after code changes (~$1.50 instead of $8)
-python eval.py --cheap-reeval results/eval_TIMESTAMP.json --verbose
+# List available domains
+python main.py --list-domains
 ```
 
-## Question Types Handled
+## Question Types
+
+### Finance (FAB Benchmark)
 
 | Type | Accuracy | Example |
 |------|----------|---------|
@@ -113,11 +96,31 @@ python eval.py --cheap-reeval results/eval_TIMESTAMP.json --verbose
 | Beat or Miss | 71% | "How did Lyft's Q4 EBITDA margin compare to guidance?" |
 | Qualitative Retrieval | 67% | "Summarize regulatory risks from Paylocity's 10-K" |
 | Complex Retrieval | 100% | "Of AMZN, META, GOOG — who plans most capex in 2025?" |
-| Financial Modeling | 50% | "What is BROS gross profit in 2026 assuming 30% CAGR?" |
+
+### FDA (510kQA Benchmark)
+
+| Type | Accuracy | Example |
+|------|----------|---------|
+| Predicate Lookup | 100% | "List all predicate devices cited in 510(k) K213456" |
+| Adverse Event Synthesis | 100% | "Count MAUDE death events for HeartMate 3 devices" |
+| Clearance Timeline | 86% | "Median clearance time for product code MAX, 2022-2024" |
+| Classification Reasoning | 80% | "What device class and pathway for product code DSQ?" |
+| Multi-Source Reasoning | 83% | "For product code LWS, list clearances + recalls since 2022" |
 
 ## Tech Stack
 
 - **LLM**: Claude Sonnet 4.6 (reasoning) + Haiku 4.5 (formatting, judging)
-- **Data**: SEC EDGAR XBRL API, filing text, earnings press releases
+- **Finance data**: SEC EDGAR XBRL API, filing text, earnings press releases
+- **FDA data**: openFDA device APIs (510(k), MAUDE, recalls, classification), AccessData PDFs
 - **Language**: Python 3.13
-- **Testing**: 102 unit/integration tests, evaluation harness with LLM-as-judge
+- **Evaluation**: Mode-of-3 LLM judging, deterministic numeric pre-check, API cost tracking
+
+## Documentation
+
+- [`docs/architecture.md`](docs/architecture.md) — Full pipeline architecture, domain interface, extraction flow
+- [`docs/fda-product-spec.md`](docs/fda-product-spec.md) — FDA domain product specification
+- [`docs/fda-tech-spec.md`](docs/fda-tech-spec.md) — FDA domain technical specification
+- [`docs/fda-eval-results.md`](docs/fda-eval-results.md) — 510kQA benchmark results (90%)
+- [`docs/problems.md`](docs/problems.md) — 103 problems encountered, each with root cause and solution
+- [`docs/agent_principles.md`](docs/agent_principles.md) — 15 design principles distilled from the problems
+- [`docs/multi-domain-refactor-spec.md`](docs/multi-domain-refactor-spec.md) — Refactor specification

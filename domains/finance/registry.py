@@ -1,4 +1,4 @@
-"""Tool definitions and executor for the finance research agent."""
+"""Tool definitions and executor for the finance domain."""
 
 from __future__ import annotations
 

@@ -1,10 +1,38 @@
-# Finance Research Agent — Technical Architecture
+# Multi-Domain Research Agent — Technical Architecture
 
 ## System Overview
 
-A financial research agent that answers quantitative questions about public companies using SEC filings as the primary data source. Optimized for the Vals AI Finance Agent Benchmark (FAB) — 50 public questions, 337 private test set. Current accuracy: **78% (39/50)** on the FAB public validation set, 14 points above the leaderboard leader (Claude Opus 4.7 at 64%).
+A domain-agnostic research agent that answers precise questions using structured public databases. The core pipeline (planner → prefetch → ReAct → extraction → calculator → formatter) is shared across domains. Each domain implements the Domain ABC, providing its own tools, prompts, concept maps, and benchmarks.
 
-Key constraint: precision. Financial questions require exact numbers (e.g., 26.1 basis points, not "about 26"). Every component is designed to minimize rounding, hallucination, and data loss.
+**Domains:**
+- **Finance** — SEC EDGAR, XBRL, earnings press releases. 84% on FAB (20 points above Opus 4.7 at 64%).
+- **FDA Regulatory** — openFDA APIs, MAUDE, AccessData PDFs. 90% on 510kQA (novel benchmark, 30 questions).
+
+Key constraint: precision. Research questions require exact values (26.1 basis points, not "about 26"; K213456, not "a Xenco Medical device"). Every component is designed to minimize rounding, hallucination, and data loss.
+
+## Domain Interface
+
+All domain-specific logic is behind the `Domain` ABC (`domains/base.py`). Core pipeline code depends only on this interface:
+
+```python
+class Domain(ABC):
+    name: str                           # "finance", "fda"
+    planner_system: str                 # System prompt for planner LLM
+    planner_prompt_template: str        # User prompt with {question}, {date} slots
+    react_system: str                   # System prompt for ReAct agent
+    react_tools: list[dict]             # Tool schemas for ReAct (Anthropic format)
+    tool_dispatch: dict[str, Callable]  # Filing type → fetcher function for prefetch
+    concept_map: dict[str, list[str]]   # Keyword → concept names for extraction matching
+    keyword_map: dict[str, list[str]]   # Phrase → standardized keys for context matching
+    benchmark_questions: list           # Benchmark for eval harness
+
+    def execute_tool(name, input_data) -> str      # Tool execution for ReAct
+    def extract_identifier(text) -> str             # Entity ID extraction (ticker, K-number)
+    def context_size_tier(state) -> int             # Prefetch context size
+    def classify_tools(tool_log) -> dict            # Route tools to extraction layers
+    def pre_extraction_filter(state) -> (state, stash)  # Domain hooks (e.g., guidance hiding)
+    def cross_validate(state) -> state              # Domain-specific sanity checks
+```
 
 ## Pipeline Flow
 
@@ -15,18 +43,18 @@ Question
 ┌─────────────────┐
 │  1. PLANNER      │  Sonnet — creates:
 │                  │    • data_needed keys (what values to find)
-│                  │    • filings_needed (which SEC filings to fetch)
+│                  │    • filings_needed (which data sources to fetch)
 │                  │    • calculation_steps (formulas to compute)
-│                  │    • clarifications (period, company, methodology)
-│                  │  Cached by question+date hash for reproducibility.
+│                  │    • clarifications (period, entity, methodology)
+│                  │  Cached by question+date+domain hash for reproducibility.
 └────────┬────────┘
          │
          ▼
 ┌─────────────────┐
 │  2a. PREFETCH    │  Programmatic — iterates filings_needed list:
-│                  │    • "xbrl" → get_company_facts(concepts)
-│                  │    • "8-K"  → get_earnings_press_release(quarter)
-│                  │    • "10-K" → get_filing_text(section, period)
+│                  │    Dispatches each entry via domain.tool_dispatch[type].
+│                  │    Finance: xbrl, 8-K, 10-K, 10-Q
+│                  │    FDA: 510k, predicates, maude, recall, classification
 │                  │  Results injected into ReAct prompt.
 └────────┬────────┘
          │
@@ -41,12 +69,12 @@ Question
          │
          ▼
 ┌─────────────────┐
-│  3. EXTRACTION   │  4-step hybrid (each fills unfilled keys, never overwrites):
-│                  │    3a. XBRL exact concept matching (precise, no LLM)
-│                  │    3b. Structured text matching (regex + keyword scoring)
+│  3. EXTRACTION   │  Multi-layer (each fills unfilled keys, never overwrites):
+│                  │    3a. Structured data matching (domain-specific parsers)
+│                  │    3b. Text matching (regex + keyword scoring from domain maps)
 │                  │    3c. LLM fact matching (Haiku assigns parsed values to keys)
 │                  │    3d. LLM raw extraction (Sonnet reads source text directly)
-│                  │  + 3.5: Cross-validation (catches duplicates & absurd ratios)
+│                  │  + 3.5: Cross-validation (domain.cross_validate)
 └────────┬────────┘
          │
          ▼
@@ -291,7 +319,7 @@ The top-scoring value for each key is selected. If no value scores above 0 for a
 
 **Philosophy:** Better to return no structured answer than a confidently wrong one. Cleared values force a narrative fallback, which is less precise but less likely to be catastrophically wrong.
 
-**Entry point:** `agent.py:_cross_validate_extraction(state)`
+**Entry point:** `domain.cross_validate(state)` — each domain implements its own checks. Finance checks duplicate values and absurd ratios. FDA checks clearance time ranges and device class validity.
 
 ### Fallback: ReAct Agent Narrative
 
@@ -299,128 +327,150 @@ When all four extraction steps fail, the answer formatter falls back to the ReAc
 
 ## Prefetch System (Step 2a)
 
-The prefetch is the most impactful component — it determines what data the extraction pipeline and agent see.
+The prefetch is the most impactful component — it determines what data the extraction pipeline and agent see. It is domain-agnostic: core iterates `filings_needed` and dispatches each entry via `domain.tool_dispatch[entry.type]`.
 
-### Primary Path: Structured `filings_needed`
+### How It Works
 
-The planner outputs a `filings_needed` list — each entry specifies exactly what to fetch:
+The planner outputs a `filings_needed` list — each entry specifies a data source to fetch:
 
+**Finance domain example:**
 ```json
-"filings_needed": [
-    {"type": "xbrl", "concepts": ["Revenues", "RevenueFromContractWithCustomerExcludingAssessedTax"], "reason": "annual revenue for CAGR"},
+[
+    {"type": "xbrl", "concepts": ["Revenues"], "reason": "annual revenue for CAGR"},
     {"type": "8-K", "period": "Q4 2024", "reason": "Q4 2024 actual earnings results"},
-    {"type": "8-K", "period": "Q3 2024", "reason": "Q3 2024 guidance for Q4"},
-    {"type": "10-K", "period": "2024", "section": "tax", "reason": "effective tax rate from income tax footnote"},
-    {"type": "10-K", "period": "2022", "section": "kpi", "reason": "2020-2022 ARPU from operational highlights"}
+    {"type": "10-K", "period": "2024", "section": "tax", "reason": "effective tax rate"}
 ]
 ```
 
-The prefetch iterates this list and fetches each entry:
+**FDA domain example:**
+```json
+[
+    {"type": "510k", "identifier": "K213456", "reason": "clearance record"},
+    {"type": "predicates", "identifier": "K213456", "reason": "predicate device chain"},
+    {"type": "maude_count", "concepts": ["brand_name:HeartMate 3"], "reason": "adverse event counts"}
+]
+```
 
-| Type | Action | Example |
-|------|--------|---------|
-| `"xbrl"` | Calls `get_company_facts(ticker, concept)` for each concept in the list. Tries alternatives in order, breaks on first success. | Revenue: tries "Revenues", then "RevenueFromContractWithCustomer..." |
-| `"8-K"` | Calls `get_earnings_press_release(ticker, period)`. Finds the press release exhibit via fiscal quarter filename matching (handles non-calendar FY, 2-digit year). | "Q4 2024" → finds `lyft-2024x12x31pressreleas.htm` |
-| `"10-K"` / `"10-Q"` | Calls `get_filing_text(ticker, type, section, period)`. Section markers jump to the right part of the 400-600K char filing. | section="tax" → jumps to "effective income tax rate" at pos 270K |
+Core prefetch (`core/agent.py:_prefetch_data`) iterates this list, looks up `domain.tool_dispatch[type]` for each entry, calls the fetcher, and collects results. Each domain defines its own type → fetcher mapping:
 
-**Per-entry ticker override:** Each filing entry can specify its own `ticker`, enabling multi-company questions with a single filings_needed list (e.g., `{"type": "xbrl", "ticker": "PEP", "concepts": ["PaymentsOfDividends"]}`). The default ticker comes from the planner's `clarifications.company`.
+| Domain | Types | Fetcher Examples |
+|--------|-------|-----------------|
+| Finance | xbrl, 8-K, 10-K, 10-Q | SEC EDGAR XBRL API, earnings press release finder, filing text with section extraction |
+| FDA | 510k, predicates, maude, maude_count, recall, classification | openFDA JSON APIs, AccessData PDF scraper |
 
-**Why this works:** The planner (LLM) does the hard thinking — which filings? which XBRL concepts? which sections? which periods? The code does the easy part — fetching what was specified. New question types work without code changes.
+**Per-entry identifier override:** Each entry can specify its own entity ID (e.g., `"ticker": "PEP"` or `"identifier": "K160702"`), enabling multi-entity questions with a single filings_needed list.
 
-**What the planner knows:** The prompt includes a reference list of common XBRL concept names, section types, and conventions (e.g., "forward-looking data for 2025 → FY2024 10-K", "beat/miss needs both actuals and prior quarter guidance").
+**Why this works:** The planner (LLM) does the hard thinking — which sources? which concepts? which periods? The domain's tool_dispatch does the fetching. Core just iterates and dispatches. New domains work by implementing `tool_dispatch` — no core changes needed.
 
-### Fallback Path: Keyword-Based Heuristics (Legacy)
-
-When `filings_needed` is empty or doesn't cover all needs, the old heuristic path runs:
-
-1. **XBRL concept map** — maps data_needed key keywords to XBRL concepts
-2. **Earnings press release** — triggered by source_strategy mentioning "8-K" or "earnings"
-3. **Section keywords** — maps question keywords to 10-K section types
-
-This fallback is being phased out as `filings_needed` coverage improves. It's harmless but redundant when the planner generates good structured requests.
-
-### Filing Access Details
+### Finance Domain: Filing Access Details
 
 **Fiscal year handling:** Press release fetcher matches by fiscal quarter in exhibit filename (e.g., "a2024q3ex991" or "tjxq4fy25"). Handles both 4-digit ("2024") and 2-digit ("fy25") year formats.
 
-**Older filings:** SEC EDGAR's `recent` array only covers ~40-50 most recent filings. For older filings, `_find_filing()` searches supplementary filing history files (`filings.files` in the submissions response).
+**Older filings:** SEC EDGAR's `recent` array only covers ~40-50 most recent filings. For older filings, `_find_filing()` searches supplementary filing history files.
 
-**Section marker priority:** Markers tried in specificity order — "effective income tax rate" before "provision for income taxes" to avoid matching risk factor boilerplate.
+**Skip-ToC logic (core):** The first match for a section marker is often a Table of Contents entry. `_extract_section()` checks if there are 2+ digit numbers within 500 chars. If not, skips to the next occurrence. This is domain-agnostic (in core) — markers are domain-supplied.
 
-**Skip-ToC logic:** The first match for a section marker is often a Table of Contents entry or forward-looking disclaimer — no actual data. `_extract_section()` checks if there are 2+ digit numbers within 500 chars of the match. If not, it skips to the next occurrence. Falls back to the first occurrence if no data-rich match is found. See P99.
+### FDA Domain: Data Access Details
 
-**10-K sections available:** revenue, tax, compensation, leases, employees, shares, cash_obligations, reconciliation, kpi, officers, mda, risk, financial_statements, notes, debt, acquisitions, segments. Arbitrary section names are also supported — the system converts underscores to spaces and uses the phrase as a fallback marker.
+**openFDA API:** Returns structured JSON with named fields. Date formats differ by endpoint (510(k) uses YYYY-MM-DD, MAUDE uses YYYYMMDD) — normalized in the parser.
+
+**Predicate device scraping:** openFDA lacks predicate K-numbers. The FDA domain scrapes AccessData HTML to find the 510(k) summary PDF URL, downloads the PDF, extracts text with pdfplumber, and uses regex `K\d{6}` to find predicate K-numbers.
+
+**Pagination ceiling:** openFDA limits skip to 25,000. For large result sets (MAUDE can have millions), use date range partitioning or the count endpoint for aggregates.
 
 ## Components
 
-### `agent.py` — Orchestrator
-**Purpose:** Runs the full pipeline. Coordinates planner, prefetch, ReAct, extraction, cross-validation, calculator, formatter.
-**Entry point:** `run(question, as_of_date=None) → dict`
-**Key functions:** `_plan()` (with caching), `_prefetch_sec_data()`, `_cross_validate_extraction()`, `_llm_extract_remaining()`
+### Core (`core/`)
 
-### `extractor.py` — Structured Data Extraction
-**Purpose:** Parses XBRL, dollar amounts, percentages from tool results. Matches to data_needed keys.
-**Entry point:** `extract_from_tool_log(tool_log, state) → state`
-**Key functions:** `_parse_xbrl_output()`, `_parse_filing_text()`, `_match_fact_to_key()`
+| File | Purpose |
+|------|---------|
+| `core/agent.py` | Domain-agnostic orchestrator. `run(question, domain, as_of_date)`. Coordinates planner, prefetch, ReAct, extraction, calculator, formatter. |
+| `core/extractor.py` | Multi-layer extraction framework. Parameterized by domain's concept_map, keyword_map, and sanity_check_config. |
+| `core/calculator.py` | Deterministic Python formula evaluation from state dict. |
+| `core/llm.py` | Anthropic API client with prompt caching, rate limiting, model routing, and cost tracking. |
+| `core/state.py` | State dict utilities (create, validate, render). |
+| `core/types.py` | Shared types: Fact, FilingRequest, ToolResult, BenchmarkQuestion. |
 
-### `tools/sec_edgar.py` — SEC Filing Tools
-**Purpose:** Fetches XBRL data, filing text, earnings press releases from SEC EDGAR.
-**Key functions:** `get_company_facts()`, `get_filing_text()`, `get_earnings_press_release()`
-**HTML conversion:** `_html_to_text()` with table structure parser — converts HTML tables to column-annotated text.
-**Section extraction:** `_extract_section()` — jumps to specific parts of long filings using keyword markers.
+### Finance Domain (`domains/finance/`)
 
-### `calculator.py` — Deterministic Calculation
-**Purpose:** Executes Python formulas from planner's calculation_steps.
-**Entry point:** `execute_calculations(state) → state`
+| File | Purpose |
+|------|---------|
+| `domain.py` | FinanceDomain — implements Domain ABC. Wires tools, prompts, concept maps, benchmark. |
+| `tools.py` | SEC EDGAR API client: XBRL, filing text, earnings press releases. HTML table parser. |
+| `concepts.py` | Financial concepts reference (CAGR, margins, ratios, GAAP vs non-GAAP). |
+| `methodology.py` | Financial methodology (beat/miss, turnover, fiscal year conventions). |
+| `identifier.py` | Stock ticker extraction from planner output. |
+| `registry.py` | Tool schemas and dispatch for ReAct loop. |
 
-### `prompts.py` — All Prompt Templates
-**Purpose:** System prompts for planner, ReAct agent, and formatter. Includes financial methodology and concepts references.
+### FDA Domain (`domains/fda/`)
 
-### `financial_methodology.py` / `financial_concepts.py` — Domain Knowledge
-**Purpose:** Correct formulas and procedures embedded in planner prompt. Aligned to FAB benchmark conventions (N = label number for CAGR, ending inventory for turnover).
+| File | Purpose |
+|------|---------|
+| `domain.py` | FDADomain — implements Domain ABC. Wires tools, prompts, concept maps, benchmark. |
+| `tools.py` | openFDA API client (510(k), MAUDE, recalls, classification) + AccessData PDF scraper. |
+| `concepts.py` | Regulatory concepts (device classes, pathways, MAUDE taxonomy). |
+| `methodology.py` | Regulatory methodology (clearance timelines, predicate analysis, event counting). |
+| `identifier.py` | K-number / product code extraction. |
+| `benchmark/` | 510kQA benchmark (30 questions with programmatic ground truth). |
 
-### `ticker.py` — Robust Ticker Extraction
-**Purpose:** Extracts stock tickers from planner output. 4 strategies, excluded words list.
+### Evaluation
 
-### `llm.py` — Anthropic API Client
-**Purpose:** Claude API calls with prompt caching and rate limiting. Model routing (Sonnet for reasoning, Haiku for formatting).
+| File | Purpose |
+|------|---------|
+| `eval.py` | Finance domain eval harness (FAB benchmark). Mode-of-3 judging, numeric pre-check, cost tracking. |
+| `main.py` | Multi-domain CLI. `--domain {finance\|fda} --question "..." --eval --list-domains` |
 
-### `eval.py` — Evaluation Harness
-**Purpose:** Runs the agent against the FAB benchmark, scores answers against rubrics.
-**Entry point:** `python eval.py [--indices 0 2 9] [--score-only FILE] [--cheap-reeval FILE]`
-**Key features:**
-- **Benchmark date:** All runs use `as_of_date="2025-02-01"` (the epoch when FAB ground truth was authored).
-- **Deterministic numeric pre-check:** Before calling the LLM judge, checks if all numbers in the criterion appear in the answer within 2% tolerance. Auto-passes if they match — eliminates judge non-determinism for numeric questions.
-- **Mode-of-3 judging:** Each rubric criterion is judged 3x by Haiku, with majority vote (2/3 or 3/3 = pass). Eliminates single-call judge variance that caused 6 questions to flip between pass/fail across runs.
-- **Cheap re-eval:** Replays extraction + calculator + formatter + judge on saved tool_logs from a previous run (~$1.50 vs ~$8 for a full run). Only reliable for judging changes, not extraction changes.
+### Backwards Compatibility (`src/`)
+
+The `src/` directory contains shim modules that re-export from `core/` and `domains/finance/`. Existing code using `from src.agent import run` continues to work — it creates a FinanceDomain internally. New code should use `from core.agent import run` with an explicit domain.
 
 ## External Dependencies
 
+### Core (all domains)
+
 | Service | Purpose | Auth | Rate Limit | Failure Mode |
 |---------|---------|------|------------|-------------|
-| SEC EDGAR XBRL API | Company financial facts | None (User-Agent header) | 10 req/sec | Returns empty/error — agent falls back to filing text |
-| SEC EDGAR Submissions | Filing metadata, accession numbers | None | 10 req/sec | Can't find filing — agent falls back to web search |
-| SEC EDGAR Archives | Raw filing HTML | None | 10 req/sec | Can't fetch document — skip this source |
 | Anthropic Claude API | LLM calls (planner, ReAct, extraction, formatting) | API key | Tier-dependent | Pipeline stops |
 | Web Search (Claude built-in) | Fallback data source | Via Claude API | Per-request | Returns no results — agent reports "not found" |
+
+### Finance Domain
+
+| Service | Purpose | Auth | Rate Limit | Failure Mode |
+|---------|---------|------|------------|-------------|
+| SEC EDGAR XBRL API | Company financial facts | None (User-Agent header) | 10 req/sec | Returns empty — falls back to filing text |
+| SEC EDGAR Submissions | Filing metadata, accession numbers | None | 10 req/sec | Can't find filing — falls back to web search |
+| SEC EDGAR Archives | Raw filing HTML | None | 10 req/sec | Can't fetch document — skip this source |
 | FMP API | Alternative financial data | API key | Tier-dependent | Returns empty — agent uses SEC data |
+
+### FDA Domain
+
+| Service | Purpose | Auth | Rate Limit | Failure Mode |
+|---------|---------|------|------------|-------------|
+| openFDA Device APIs | 510(k), MAUDE, recalls, classification | Optional API key | 240 req/min (with key) | Returns error — agent reports "not found" |
+| FDA AccessData | 510(k) detail pages + summary PDFs | None | ~1 req/sec (conservative) | No PDF available — predicate lookup fails gracefully |
 
 ## Known Constraints & Gotchas
 
-### Date Context
-The planner uses today's date to determine "most recent" periods. The FAB benchmark was authored when FY2024 was the latest available. Running in 2026, the planner picks FY2025 data, which may not match ground truth. **Addressed:** `run(question, as_of_date="2025-02-01")` overrides the planner's and ReAct agent's date context. The eval harness sets this automatically via `BENCHMARK_DATE`.
+### Cross-Domain
 
-### XBRL Concept Matching
-Substring matching (`if metric.lower() in concept_name.lower()`) causes false matches. "IncomeTaxExpenseBenefit" matches both the exact concept AND "CurrentIncomeTaxExpenseBenefit". The extractor then fills unrelated keys with the same value. See P42.
+**Date Context:** The planner uses today's date to determine "most recent" periods. Benchmarks require point-in-time answers. `run(question, domain, as_of_date="2025-02-01")` overrides the date context. Each BenchmarkQuestion carries its own `as_of_date`.
 
-### 10-K Size vs Context Limit
-10-K filings are 400-600K chars. Default 15K char limit means >95% of the filing is invisible. Section-targeted fetching mitigates this but requires knowing which section to fetch. Questions about data in unexpected sections may fail.
+**Planner Cache Key:** Includes domain name — `MD5(question + date + domain.name)`. Without the domain name, finance and FDA plans for the same question text would collide.
 
-### Table Column Disambiguation
-The table parser annotates values with column headers for simple tables (Netflix contractual obligations). Multi-level headers (Lyft: "Three Months Ended" + "Dec. 31, 2024") and complex layouts may not parse correctly. The position tiebreaker (first value = most recent quarter) works for financial statements but not all table types. See P59.
+### Finance Domain
 
-### Non-Calendar Fiscal Years
-The earnings press release fetcher matches by fiscal quarter in exhibit filename. This handles Micron (FY ends Sep) and Oracle (FY ends May). But period detection from the planner still assumes calendar years in many places. See P45.
+**XBRL Concept Matching:** Substring matching causes false matches. "IncomeTaxExpenseBenefit" matches both the exact concept AND "CurrentIncomeTaxExpenseBenefit". See P42.
 
-### Older SEC Filings
-The SEC EDGAR submissions API's `recent` array only covers the most recent ~40-50 filings. For older filings (typically 3+ years back for prolific filers, or any filing pre-2021 for many companies), `_find_filing` searches supplementary filing history files listed in `filings.files`. This adds 1-2 extra API calls but enables access to filings going back to 2000. See P67.
+**10-K Size vs Context Limit:** 10-K filings are 400-600K chars. Section-targeted fetching with domain-configured context tiers (50K qualitative / 15K quantitative / 4K simple) mitigates this.
+
+**Non-Calendar Fiscal Years:** Press release fetcher handles non-standard fiscal years (Micron FY ends Sep, Oracle FY ends May) via fiscal quarter filename matching. See P45.
+
+### FDA Domain
+
+**No Predicate Data in API:** openFDA 510(k) endpoint has no predicate device field. Predicate K-numbers are extracted from 510(k) summary PDFs via AccessData scraping. Coverage is good for 2010+ submissions; older ones may lack PDFs.
+
+**MAUDE Date Format:** MAUDE uses YYYYMMDD while 510(k) uses YYYY-MM-DD. The parser normalizes all dates to YYYY-MM-DD.
+
+**Pagination Ceiling:** openFDA limits `skip` to 25,000. For product codes with millions of MAUDE events, use date range partitioning or the count endpoint for aggregates.
+
+**Ground Truth Drift:** openFDA data updates continuously. Benchmark answers for count-based questions will change over time. Each question carries a `ground_truth_captured_at` date.

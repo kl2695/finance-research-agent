@@ -1,4 +1,4 @@
-# Finance Research Agent — Action Items Backlog
+# Multi-Domain Research Agent — Action Items Backlog
 
 Prioritized list of next steps. Updated after each eval run.
 

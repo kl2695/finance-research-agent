@@ -1,6 +1,6 @@
-# Finance Research Agent — Changelog
+# Multi-Domain Research Agent — Changelog
 
-All changes with rationale. This project is a rewrite of the research-agent, optimized for the Vals AI Finance Agent Benchmark.
+All changes with rationale. Started as a finance research agent optimized for the Vals AI FAB benchmark, then generalized into a multi-domain pipeline with pluggable domain modules.
 
 ---
 

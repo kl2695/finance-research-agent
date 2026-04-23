@@ -1,10 +1,11 @@
-"""FAB Benchmark Evaluation Harness.
+"""Finance Domain Evaluation Harness (FAB Benchmark).
 
-Runs the agent against the Vals AI Finance Agent Benchmark public set,
+Runs the finance domain against the Vals AI Finance Agent Benchmark public set,
 scores answers against rubrics using LLM-as-judge, and outputs a report.
+For multi-domain eval, use: python main.py --domain {finance|fda} --eval
 
 Usage:
-    python eval.py                    # Run all 50 questions
+    python eval.py                    # Run all 50 FAB questions
     python eval.py --indices 0 2 9    # Run specific questions
     python eval.py --score-only FILE  # Score a previous run without re-running
 """
