@@ -100,29 +100,133 @@ The planner (Step 1) is non-deterministic — different runs produce different k
 
 **Entry point:** `agent.py:_plan(question, as_of_date, use_cache=True)`
 
-## ReAct Agent Details (Step 2b)
+## ReAct Agent Loop (Step 2b)
+
+The ReAct (Reasoning + Acting) loop is the central reasoning engine. It receives prefetched data, reasons about what's missing, makes additional tool calls, and produces a research narrative with findings.
+
+### How It Works
+
+The loop is implemented in `core/llm.py:call_with_tools()`. It uses the Anthropic tool-use protocol:
+
+```
+┌─────────────────────────────────────────────────────────┐
+│  INITIAL MESSAGE                                        │
+│  System: domain.react_system (tool guidance, examples)  │
+│  User: plan JSON + prefetched data + question           │
+│  Tools: [web_search] + domain.react_tools               │
+└──────────────────────┬──────────────────────────────────┘
+                       │
+                       ▼
+┌──────────────────────────────────────┐
+│  LLM RESPONSE (Sonnet)              │
+│  Contains: text blocks + tool_use   │
+│  blocks interleaved                 │
+│                                     │◄──────────┐
+│  If stop_reason == "tool_use":      │           │
+│    Execute each tool_use block      │           │
+│    via domain.execute_tool()        │           │
+│    Append results as tool_result    │           │
+│    Continue loop ───────────────────┼───────────┘
+│                                     │
+│  If stop_reason == "end_turn":      │
+│    Extract final text               │
+│    Return (narrative, tool_log)     │
+└──────────────────────────────────────┘
+```
+
+Each turn:
+1. Send full conversation history (system + messages) to Sonnet
+2. Sonnet responds with text (reasoning) and/or `tool_use` blocks (actions)
+3. For each `tool_use`: call `domain.execute_tool(name, input)`, get string result
+4. Append assistant response + tool results to messages
+5. Repeat until Sonnet says `end_turn` (done reasoning) or max turns reached
+
+### What Goes Into the Prompt
+
+The ReAct agent receives a rich context assembled from three sources:
+
+**System prompt** (`domain.react_system`):
+- Tool selection hierarchy (which tools to prefer and when)
+- Precision instructions ("do NOT round", "preserve ALL significant digits")
+- Domain-specific guidance (finance: "use FORMAL NAMES from SEC filings"; FDA: "clearance, not approval")
+- Cross-validation instructions ("check that your numbers are internally consistent")
+- Domain concept reference (injected via the domain's concepts module)
+
+**User message** (assembled by `core/agent.py`):
+- The full planner output as JSON (plan, data_needed, filings_needed, calculation_steps)
+- Research date context (`as_of_date`)
+- Few-shot examples of successful research patterns (domain-supplied, see below)
+- Prefetched data (appended after the prompt, truncated by `domain.context_size_tier`)
+
+**Tools** (available for the agent to call):
+- `web_search` — always provided by core (Anthropic server-side tool)
+- Domain-specific tools — provided by `domain.react_tools` (e.g., `sec_edgar_financials`, `openfda_510k`)
+
+### Tool Execution
+
+Two categories of tools with different execution paths:
+
+**Server-side tools** (web_search): Executed by Anthropic's servers. Results appear as `web_search_tool_result` blocks in the response. The agent never "calls" these — it just decides to search and Anthropic handles execution. URLs from search results are logged for citation.
+
+**Local tools** (domain tools): Executed by `domain.execute_tool(name, input_data) -> str`. The domain maps tool names to functions. For finance: `sec_edgar_financials` → `get_company_facts()`, `sec_edgar_earnings` → `get_earnings_press_release()`. For FDA: `openfda_510k` → `search_510k()`, `openfda_predicates` → `get_510k_predicates()`. Results are truncated to 4,000 chars before appending to the conversation (prevents context overflow).
+
+### Tool Log
+
+Every tool call (both server-side and local) is recorded in `tool_log` — a list of `{"tool": name, "input": {...}, "output": "..."}` dicts. This log serves three purposes:
+1. **Extraction input** — the extraction pipeline (Step 3) parses tool outputs to fill `data_needed` values
+2. **Offline replay** — saved with eval results for cheap-reeval (replay extraction without re-running the agent)
+3. **Debugging** — the action log traces every tool call with inputs and output preview
 
 ### Few-Shot Examples
 
-The ReAct prompt includes 3 worked research patterns to guide the agent's tool usage and reasoning:
+Each domain provides 3 worked research patterns in the ReAct prompt. These guide the agent's tool usage strategy and reasoning quality.
 
+**Finance domain examples:**
 1. **Beat/miss with guidance range** — TJX pre-tax margin: finds actuals in current 8-K, guidance in prior quarter's 8-K, computes beat from BOTH low and high end, cross-validates against company's own statement.
 2. **Multi-company comparison** — KO dividend payout ratio vs peers: identifies competitors, fetches data for each via XBRL, computes ratios, ranks.
 3. **Qualitative deep-section extraction** — Shift4 vendor concentration risk: navigates past ToC/disclaimer matches to find the actual disclosure in notes to financial statements.
 
+**FDA domain examples:**
+1. **Clearance timeline computation** — median clearance time for product code DRG: fetches all clearances in date range, computes per-record date arithmetic, reports median with sample size.
+2. **Multi-source cross-reference** — product code LWS: three separate tool calls (510(k) + MAUDE + recalls), merges results, reports synthesis with cross-references.
+3. **Predicate device lookup** — K213456: calls predicate tool (PDF scraping), identifies predicate K-numbers, looks up each predicate's clearance date via follow-up 510(k) calls.
+
 ### Context Size Tiers
 
-Prefetched filing data is injected into the ReAct prompt with size limits based on question type:
+Prefetched data is injected into the ReAct prompt with size limits determined by `domain.context_size_tier(state)`:
 
+**Finance domain:**
 | Question Type | Limit per Source | Rationale |
 |---------------|-----------------|-----------|
 | Qualitative (no calculation, "lookup only") | 50K chars | Need full sections for narrative answers |
-| Quantitative with filing sections (10-K/10-Q with section) | 15K chars | Need tables from targeted sections |
+| Quantitative with filing sections (10-K/10-Q) | 15K chars | Need tables from targeted sections |
 | Simple XBRL calculation | 4K chars | Just need confirmation data |
 
-### Max Turns Scaling
+**FDA domain:**
+| Question Type | Limit per Source | Rationale |
+|---------------|-----------------|-----------|
+| Predicate lookup or qualitative | 30K chars | PDF text is long |
+| Standard queries | 8K chars | openFDA JSON is compact |
 
-Complex questions with 5+ filings_needed entries get 15 turns (vs 10 default). This accommodates multi-company comparisons and questions requiring data from many filings. Motivated by FAB paper insight: "top performers register high numbers of tool calls."
+### Safeguards
+
+**Max turns:** 10 default, 15 for complex questions (5+ filings_needed entries). Prevents runaway loops where the agent keeps calling tools without converging. Motivated by FAB paper insight: "top performers register high numbers of tool calls."
+
+**Wall-clock timeout:** 120 seconds. If the loop exceeds this, it returns whatever results it has. Prevents single questions from blocking the eval pipeline. Added after P84 where one question's ReAct loop ran for 8 minutes.
+
+**Tool output truncation:** Each tool result is capped at 4,000 chars before being appended to the conversation. Prevents a single large filing from consuming the entire context window. The full output is still available in `tool_log` for the extraction pipeline.
+
+### What the ReAct Agent Produces
+
+The agent's final text output is a **research narrative** — natural language summarizing what it found, with exact numbers and source citations. This narrative serves two purposes:
+
+1. **Input to extraction** — the extraction pipeline (Step 3) also receives the raw tool_log, but the narrative provides semantic context that helps the LLM extraction fallback (Step 3d) understand which numbers answer which questions.
+
+2. **Fallback answer source** — if the structured extraction pipeline fails to fill all `data_needed` values, the formatter (Step 5) falls back to the narrative. This is less precise but more robust. Example: Micron beat/miss was answered from the narrative when structured extraction couldn't distinguish quarterly from annual figures.
+
+### Non-Determinism
+
+The ReAct loop is the primary source of score variance between runs. The same question can produce different tool call sequences, find different data, or reason differently. This is inherent to LLM-based reasoning — the planner cache eliminates plan variance, and mode-of-3 judging reduces judge variance, but the ReAct agent's tool path remains stochastic. In the finance eval, 6 of 50 questions flip between pass/fail across runs due to ReAct non-determinism.
 
 ## Data Extraction Flow (Step 3 — the critical path)
 
