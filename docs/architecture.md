@@ -34,60 +34,194 @@ class Domain(ABC):
     def cross_validate(state) -> state              # Domain-specific sanity checks
 ```
 
+## System Architecture
+
+```
+┌──────────────────────────────────────────────────────────────────────────────────┐
+│                              MULTI-DOMAIN RESEARCH AGENT                        │
+│                                                                                  │
+│  ┌────────────────────────────────────────────────────────────────────────────┐  │
+│  │                          CORE PIPELINE (core/)                             │  │
+│  │                                                                            │  │
+│  │   main.py / eval.py                                                        │  │
+│  │        │                                                                   │  │
+│  │        ▼                                                                   │  │
+│  │   ┌─────────┐    domain.planner_system    ┌───────────────┐                │  │
+│  │   │  agent   │───────────────────────────►│  Anthropic API │                │  │
+│  │   │  .py     │    domain.react_system      │  (Sonnet/Haiku)│                │  │
+│  │   │         │◄───────────────────────────│               │                │  │
+│  │   │  run()   │    domain.answer_system     └───────────────┘                │  │
+│  │   └────┬────┘                                     ▲                        │  │
+│  │        │                                          │                        │  │
+│  │        │  domain.tool_dispatch[type]               │ tool_use / tool_result │  │
+│  │        │  domain.execute_tool(name, input)         │                        │  │
+│  │        ▼                                          │                        │  │
+│  │   ┌──────────┐   ┌──────────┐   ┌────────────┐   │                        │  │
+│  │   │extractor │   │calculator│   │  llm.py     │───┘                        │  │
+│  │   │  .py     │   │  .py     │   │  call_claude│                            │  │
+│  │   └──────────┘   └──────────┘   │  call_with_ │                            │  │
+│  │        ▲                        │  tools      │                            │  │
+│  │        │ domain.concept_map     └────────────┘                            │  │
+│  │        │ domain.keyword_map          ▲                                     │  │
+│  │        │ domain.classify_tools       │ cost tracking                       │  │
+│  │        │ domain.cross_validate       │ rate limiting                       │  │
+│  └────────┼─────────────────────────────┼─────────────────────────────────────┘  │
+│           │                             │                                        │
+│  ┌────────┼─────────────────────────────┼─────────────────────────────────────┐  │
+│  │        │      DOMAIN INTERFACE (domains/base.py)                           │  │
+│  │        │      Domain ABC — 15+ methods/properties                          │  │
+│  └────────┼─────────────────────────────┼─────────────────────────────────────┘  │
+│           │                             │                                        │
+│  ┌────────┴──────────────┐  ┌───────────┴─────────────┐                         │
+│  │  FINANCE DOMAIN       │  │  FDA DOMAIN              │                         │
+│  │  domains/finance/     │  │  domains/fda/            │                         │
+│  │                       │  │                          │                         │
+│  │  Prompts:             │  │  Prompts:                │                         │
+│  │   FINANCIAL_CONCEPTS  │  │   FDA_CONCEPTS           │                         │
+│  │   FINANCIAL_METHODOLOGY│ │   FDA_METHODOLOGY        │                         │
+│  │   Beat/miss examples  │  │   Clearance examples     │                         │
+│  │                       │  │                          │                         │
+│  │  Tools:               │  │  Tools:                  │                         │
+│  │   sec_edgar_financials│  │   openfda_510k           │                         │
+│  │   sec_edgar_earnings  │  │   openfda_predicates     │                         │
+│  │   sec_edgar_filing    │  │   openfda_maude          │                         │
+│  │   fmp_financials      │  │   openfda_recall         │                         │
+│  │                       │  │   openfda_classification │                         │
+│  │  Identifier:          │  │                          │                         │
+│  │   Stock ticker        │  │  Identifier:             │                         │
+│  │   (LYFT, AAPL)        │  │   K-number / product code│                         │
+│  │                       │  │   (K213456, DRG)         │                         │
+│  │  Benchmark:           │  │                          │                         │
+│  │   FAB (50 questions)  │  │  Benchmark:              │                         │
+│  │   84% accuracy        │  │   510kQA (30 questions)  │                         │
+│  │                       │  │   90% accuracy           │                         │
+│  └───────────┬───────────┘  └────────────┬────────────┘                         │
+│              │                           │                                       │
+└──────────────┼───────────────────────────┼───────────────────────────────────────┘
+               │                           │
+               ▼                           ▼
+┌──────────────────────────┐  ┌──────────────────────────────────┐
+│  EXTERNAL DATA SOURCES   │  │  EXTERNAL DATA SOURCES           │
+│                          │  │                                  │
+│  SEC EDGAR               │  │  openFDA APIs                    │
+│   • XBRL company facts   │  │   • /device/510k.json            │
+│   • Filing archives (HTML)│  │   • /device/event.json (MAUDE)   │
+│   • Submissions metadata │  │   • /device/recall.json           │
+│                          │  │   • /device/classification.json   │
+│  FMP API                 │  │                                  │
+│   • Income statements    │  │  FDA AccessData                  │
+│   • Balance sheets       │  │   • 510(k) detail pages (HTML)   │
+│                          │  │   • Summary PDFs (predicate data) │
+└──────────────────────────┘  └──────────────────────────────────┘
+```
+
 ## Pipeline Flow
 
 ```
-Question
-    │
-    ▼
+Question + Domain
+       │
+       ▼
 ┌─────────────────┐
-│  1. PLANNER      │  Sonnet — creates:
+│  1. PLANNER      │  Sonnet — creates structured research plan:
 │                  │    • data_needed keys (what values to find)
 │                  │    • filings_needed (which data sources to fetch)
 │                  │    • calculation_steps (formulas to compute)
 │                  │    • clarifications (period, entity, methodology)
-│                  │  Cached by question+date+domain hash for reproducibility.
+│                  │  Prompt: domain.planner_system + domain.planner_prompt_template
+│                  │  Cached by MD5(question + date + domain.name)
 └────────┬────────┘
          │
          ▼
 ┌─────────────────┐
-│  2a. PREFETCH    │  Programmatic — iterates filings_needed list:
-│                  │    Dispatches each entry via domain.tool_dispatch[type].
-│                  │    Finance: xbrl, 8-K, 10-K, 10-Q
-│                  │    FDA: 510k, predicates, maude, recall, classification
-│                  │  Results injected into ReAct prompt.
+│  2a. PREFETCH    │  Programmatic — no LLM, just API calls:
+│                  │    for entry in filings_needed:
+│                  │      fetcher = domain.tool_dispatch[entry.type]
+│                  │      result = fetcher(entry, identifier)
+│                  │    Identifier from domain.extract_identifier()
+│                  │    Results + tool_log collected for next steps.
 └────────┬────────┘
-         │
+         │  prefetch_results injected into ReAct prompt
          ▼
 ┌─────────────────┐
-│  2b. ReAct LOOP  │  Sonnet — reasons with tools. Prefetched data in prompt.
-│                  │  Agent may call additional tools (web search, filing text).
-│                  │  Produces research narrative.
-│                  │  3 few-shot examples guide research patterns.
-│                  │  max_turns: 15 for complex (5+ filings), 10 default.
+│  2b. ReAct LOOP  │  Sonnet multi-turn with tool use:
+│                  │    System: domain.react_system
+│                  │    Tools: [web_search] + domain.react_tools
+│                  │    Executor: domain.execute_tool
+│                  │    Max turns: 15 (complex) or 10 (default)
+│                  │    Timeout: 120s wall clock
+│                  │  Produces: research narrative + tool_log
 └────────┬────────┘
-         │
+         │  tool_log (prefetch + ReAct combined)
          ▼
 ┌─────────────────┐
-│  3. EXTRACTION   │  Multi-layer (each fills unfilled keys, never overwrites):
-│                  │    3a. Structured data matching (domain-specific parsers)
-│                  │    3b. Text matching (regex + keyword scoring from domain maps)
-│                  │    3c. LLM fact matching (Haiku assigns parsed values to keys)
-│                  │    3d. LLM raw extraction (Sonnet reads source text directly)
-│                  │  + 3.5: Cross-validation (domain.cross_validate)
+│  3. EXTRACTION   │  Fill state.data_needed from tool_log:
+│                  │    Classify: domain.classify_tools(tool_log)
+│                  │      → {"structured": [...], "prose": [...]}
+│                  │    3a. Structured: domain-specific parsers
+│                  │    3b. Prose: regex + domain.keyword_map scoring
+│                  │        (with domain.pre/post_extraction hooks)
+│                  │    3c. LLM fact match: Haiku + domain.extraction_hints
+│                  │    3d. LLM raw extraction: Sonnet reads source text
+│                  │    3.5: domain.cross_validate(state)
+│                  │  Rule: filled keys are NEVER overwritten.
 └────────┬────────┘
-         │
+         │  state.data_needed now populated
          ▼
 ┌─────────────────┐
-│  4. CALCULATOR   │  Python eval — deterministic arithmetic from state dict.
-│                  │  Formulas defined by planner, executed as code.
+│  4. CALCULATOR   │  Deterministic Python eval:
+│                  │    for step in state.calculation_steps:
+│                  │      result = eval(step.formula, data_needed_values)
+│                  │    No LLM. Pure arithmetic.
 └────────┬────────┘
-         │
+         │  state.calculation_steps now have results
          ▼
 ┌─────────────────┐
-│  5. FORMATTER    │  Sonnet — formats answer from state + research narrative.
-│                  │  Falls back to narrative if structured pipeline fails.
+│  5. FORMATTER    │  Haiku — formats final answer:
+│                  │    Prompt: domain.answer_system + domain.answer_prompt_template
+│                  │    Input: research narrative + calculation results
+│                  │    Falls back to narrative if structured data incomplete.
+│                  │  Produces: answer text with citations
 └─────────────────┘
+```
+
+## Data Flow: State Dict
+
+The **state dict** is the central data structure that flows through every pipeline stage. Created by the planner, filled by extraction, computed by the calculator, formatted into the answer.
+
+```
+state = {
+    "plan": "one-line description",
+    "clarifications": {
+        "company": "Lyft, Inc., ticker LYFT" | "K-number K213456",
+        "period": "Q4 2024" | "2022-2024",
+        "formula": "python expression" | "lookup only",
+        "source_strategy": "which databases to search",
+    },
+    "data_needed": {
+        "revenue_fy2024": {              # ← planner creates these keys
+            "value": 5791000000,         # ← extraction fills this
+            "unit": "USD",
+            "source": "XBRL (Revenues)", # ← extraction records provenance
+            "confidence": "high",
+            "label": "Revenue FY2024",
+        },
+        "clearance_date_k213456": {
+            "value": "2022-06-24",
+            "unit": "date",
+            "source": "openFDA 510(k)",
+            ...
+        }
+    },
+    "filings_needed": [                  # ← planner specifies, prefetch consumes
+        {"type": "xbrl", "concepts": ["Revenues"], "reason": "..."},
+        {"type": "510k", "identifier": "K213456", "reason": "..."},
+    ],
+    "calculation_steps": [               # ← planner defines, calculator executes
+        {"step": "cagr", "formula": "(revenue_fy2024/revenue_fy2021)**(1/3)-1",
+         "inputs": ["revenue_fy2024", "revenue_fy2021"], "result": 0.156}
+    ],
+    "answer": {"value": 0.156, "formatted": "15.6%", "sources": [...]}
+}
 ```
 
 ## Planner Caching
